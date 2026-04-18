@@ -1,0 +1,73 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ChatGPT Virtualizer</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body class="popup-body">
+  <div class="popup-wrap">
+    <header class="popup-header">
+      <div class="app-title">ChatGPT DOM Virtualizer</div>
+      <div class="app-subtitle">Performance Dashboard</div>
+    </header>
+
+    <section class="stats-grid">
+      <article class="stat-card">
+        <div class="stat-label">Visible</div>
+        <div class="stat-value" id="statVisible">--</div>
+      </article>
+      <article class="stat-card">
+        <div class="stat-label">Total</div>
+        <div class="stat-value" id="statTotal">--</div>
+      </article>
+      <article class="stat-card">
+        <div class="stat-label">Status</div>
+        <div class="stat-value stat-status" id="statStatus">--</div>
+      </article>
+    </section>
+
+    <section class="panel">
+      <div class="panel-title">Controls</div>
+
+      <div class="control-row">
+        <div class="control-text">
+          <div class="control-label">Enable Virtualization</div>
+          <div class="control-hint">Turn DOM virtualization on/off</div>
+        </div>
+        <label class="switch">
+          <input id="enabled" type="checkbox" />
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <div class="control-block">
+        <div class="range-head">
+          <div>
+            <div class="control-label">Message Limit</div>
+            <div class="control-hint">Rendered messages in DOM</div>
+          </div>
+          <div class="range-value"><span id="limitValue">30</span></div>
+        </div>
+        <input id="messageLimit" type="range" min="10" max="100" step="1" />
+      </div>
+
+      <div class="control-row">
+        <div class="control-text">
+          <div class="control-label">Auto Optimization</div>
+          <div class="control-hint">Adaptive limit tuning</div>
+        </div>
+        <label class="switch">
+          <input id="autoOptimization" type="checkbox" />
+          <span class="slider"></span>
+        </label>
+      </div>
+    </section>
+
+    <footer class="popup-footer" id="footerStatus">Ready</footer>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
