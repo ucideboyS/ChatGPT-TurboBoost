@@ -1,313 +1,177 @@
 (() => {
-
   "use strict";
+  const DEFAULTS = { enabled: true, messageLimit: 30, fetchBuffer: 40 };
+  const $ = id => document.getElementById(id);
 
-
-
-  const DEFAULTS = {
-
-    enabled: true,
-
-    messageLimit: 40,
-
-    autoOptimization: false
-
-  };
-
-
-
-  const $ = (id) => document.getElementById(id);
-
-
-
-  function setFooter(text) {
-
-    $("footerStatus").textContent = text;
-
+  /* ── Status Pill ── */
+  function status(t, live) {
+    $("pillText").textContent = t;
+    $("pill").classList.toggle("live", !!live);
   }
 
-
-
-  function applySettingsToUI(cfg) {
-
-    $("enabled").checked = !!cfg.enabled;
-
-    $("messageLimit").value = Number(cfg.messageLimit);
-
-    $("limitValue").textContent = String(cfg.messageLimit);
-
-    $("autoOptimization").checked = !!cfg.autoOptimization;
-
+  /* ── Range Slider Fill ── */
+  function updateSliderFill() {
+    const el = $("msgLimit");
+    const min = Number(el.min) || 10;
+    const max = Number(el.max) || 100;
+    const val = Number(el.value) || 30;
+    const pct = ((val - min) / (max - min)) * 100;
+    el.style.backgroundSize = `${pct}% 100%`;
   }
 
-
-
-  function readSettingsFromUI() {
-
-    return {
-
-      enabled: $("enabled").checked,
-
-      messageLimit: Number($("messageLimit").value),
-
-      autoOptimization: $("autoOptimization").checked
-
-    };
-
+  /* ── Segmented Control ── */
+  function updateSegHint(v) {
+    const hint = $("segHint");
+    if (!hint) return;
+    if (v === 40) hint.textContent = "40+ messages load";
+    else if (v === 100) hint.textContent = "100+ messages load";
+    else if (v === 200) hint.textContent = "200+ messages load";
+    else hint.textContent = `${v}+ messages load`;
   }
 
-
-
-  async function getActiveChatGPTTab() {
-
-    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-
-    const tab = tabs?.[0];
-
-    if (!tab?.id || !tab.url) return null;
-
-
-
-    const isChatGPT =
-
-      tab.url.startsWith("https://chatgpt.com/") ||
-
-      tab.url.startsWith("https://chat.openai.com/");
-
-
-
-    return isChatGPT ? tab : null;
-
-  }
-
-
-
-  async function ensureContentScript(tabId) {
-
-    try {
-
-      const pong = await chrome.tabs.sendMessage(tabId, { type: "CGPTV_PING" });
-
-      return !!pong?.ok;
-
-    } catch {
-
-      return false;
-
+  function initSeg() {
+    const seg = $("seg");
+    const chip = $("segChip");
+    const opts = seg.querySelectorAll(".seg-opt");
+    function positionChip(opt) {
+      chip.style.left = opt.offsetLeft + "px";
+      chip.style.width = opt.offsetWidth + "px";
+      const val = Number(opt.dataset.v);
+      updateSegHint(val);
     }
-
-  }
-
-
-
-  function renderStats(stats, cfg) {
-
-    const rendered = Number(stats?.renderedMessages ?? 0);
-
-    const total = Number(stats?.totalMessages ?? 0);
-
-    const enabled = typeof stats?.isEnabled === "boolean" ? stats.isEnabled : !!cfg.enabled;
-
-
-
-    $("statVisible").textContent = String(rendered);
-
-    $("statTotal").textContent = String(total);
-
-    $("statStatus").textContent = enabled ? "Active" : "Off";
-
-    $("statStatus").classList.toggle("is-off", !enabled);
-
-  }
-
-
-
-  async function requestLiveStats() {
-
-    const tab = await getActiveChatGPTTab();
-
-    if (!tab) {
-
-      renderStats({ renderedMessages: 0, totalMessages: 0, isEnabled: false }, DEFAULTS);
-
-      setFooter("Open ChatGPT tab for live stats");
-
-      return;
-
-    }
-
-
-
-    const ready = await ensureContentScript(tab.id);
-
-    if (!ready) {
-
-      renderStats({ renderedMessages: 0, totalMessages: 0, isEnabled: false }, readSettingsFromUI());
-
-      setFooter("Refresh ChatGPT tab once");
-
-      return;
-
-    }
-
-
-
-    try {
-
-      const response = await chrome.tabs.sendMessage(tab.id, { type: "CGPTV_GET_STATS" });
-
-      if (response?.ok && response.stats) {
-
-        renderStats(response.stats, readSettingsFromUI());
-
-        setFooter("Live data connected");
-
-      } else {
-
-        setFooter("Stats unavailable");
-
-      }
-
-    } catch {
-
-      setFooter("Could not fetch stats");
-
-    }
-
-  }
-
-
-
-  async function broadcastSettings(payload) {
-
-    const tab = await getActiveChatGPTTab();
-
-    if (!tab) return;
-
-
-
-    try {
-
-      await chrome.tabs.sendMessage(tab.id, { type: "CGPTV_UPDATE_SETTINGS", payload });
-
-    } catch {}
-
-  }
-
-
-
-  function saveSettings(payload) {
-
-    return new Promise((resolve) => chrome.storage.sync.set(payload, () => resolve()));
-
-  }
-
-
-
-  function debounce(fn, wait = 250) {
-
-    let t = null;
-
-    return (...args) => {
-
-      clearTimeout(t);
-
-      t = setTimeout(() => fn(...args), wait);
-
-    };
-
-  }
-
-
-
-  const debouncedSave = debounce(async () => {
-
-    const payload = readSettingsFromUI();
-
-    await saveSettings(payload);
-
-    await broadcastSettings(payload);
-
-    setFooter("Settings saved");
-
-    await requestLiveStats();
-
-  }, 250);
-
-
-
-  function bindEvents() {
-
-    ["enabled", "autoOptimization"].forEach((id) => {
-
-      $(id).addEventListener("change", async () => {
-
-        const payload = readSettingsFromUI();
-
-        await saveSettings(payload);
-
-        await broadcastSettings(payload);
-
-        setFooter("Settings saved");
-
-        await requestLiveStats();
-
+    opts.forEach(o => {
+      o.addEventListener("click", () => {
+        opts.forEach(x => x.classList.remove("active"));
+        o.classList.add("active");
+        positionChip(o);
+        
+        // Auto-update message limit
+        const v = Number(o.dataset.v);
+        let limit = v;
+        if (limit > 100) limit = 100; // max slider limit
+        $("msgLimit").value = limit;
+        $("limVal").textContent = limit;
+        updateSliderFill();
+
+        commit();
       });
-
     });
-
-
-
-    $("messageLimit").addEventListener("input", () => {
-
-      $("limitValue").textContent = $("messageLimit").value;
-
-      debouncedSave();
-
+    // Initial position after layout
+    requestAnimationFrame(() => {
+      const active = seg.querySelector(".seg-opt.active");
+      if (active) positionChip(active);
     });
-
-
-
-    $("messageLimit").addEventListener("change", async () => {
-
-      $("limitValue").textContent = $("messageLimit").value;
-
-      const payload = readSettingsFromUI();
-
-      await saveSettings(payload);
-
-      await broadcastSettings(payload);
-
-      setFooter("Settings saved");
-
-      await requestLiveStats();
-
-    });
-
   }
 
+  function setSegValue(val) {
+    const seg = $("seg");
+    const chip = $("segChip");
+    const opts = seg.querySelectorAll(".seg-opt");
+    const v = String(val);
+    opts.forEach(o => {
+      const isActive = o.dataset.v === v;
+      o.classList.toggle("active", isActive);
+      if (isActive) {
+        requestAnimationFrame(() => {
+          chip.style.left = o.offsetLeft + "px";
+          chip.style.width = o.offsetWidth + "px";
+          updateSegHint(Number(v));
+        });
+      }
+    });
+  }
 
+  function getSegValue() {
+    const active = $("seg").querySelector(".seg-opt.active");
+    return Number(active?.dataset.v || 40);
+  }
+
+  /* ── UI ── */
+  function applyUI(c) {
+    $("enabled").checked = !!c.enabled;
+    $("msgLimit").value = Number(c.messageLimit);
+    $("limVal").textContent = String(c.messageLimit);
+    updateSliderFill();
+    setSegValue(c.fetchBuffer || 40);
+  }
+
+  function readUI() {
+    return {
+      enabled: $("enabled").checked,
+      messageLimit: Number($("msgLimit").value),
+      fetchBuffer: getSegValue(),
+    };
+  }
+
+  /* ── Chrome API ── */
+  async function getTab() {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    const t = tabs?.[0];
+    if (!t?.id || !t.url) return null;
+    return (t.url.startsWith("https://chatgpt.com/") || t.url.startsWith("https://chat.openai.com/")) ? t : null;
+  }
+
+  async function ping(id) {
+    try { return !!(await chrome.tabs.sendMessage(id, { type: "CGPTV_PING" }))?.ok; }
+    catch { return false; }
+  }
+
+  function renderStats(s, c) {
+    const v = Number(s?.renderedMessages ?? 0);
+    const t = Number(s?.totalMessages ?? 0);
+    const on = typeof s?.isEnabled === "boolean" ? s.isEnabled : !!c.enabled;
+    $("sVis").textContent = String(v);
+    $("sTot").textContent = String(t);
+    $("sSt").textContent = on ? "Active" : "Off";
+    $("sSt").classList.toggle("off", !on);
+  }
+
+  async function refresh() {
+    const tab = await getTab();
+    if (!tab) { renderStats({}, DEFAULTS); status("Open ChatGPT tab"); return; }
+    if (!(await ping(tab.id))) { renderStats({}, readUI()); status("Refresh tab"); return; }
+    try {
+      const r = await chrome.tabs.sendMessage(tab.id, { type: "CGPTV_GET_STATS" });
+      if (r?.ok && r.stats) { renderStats(r.stats, readUI()); status("Connected", true); }
+      else status("Unavailable");
+    } catch { status("Disconnected"); }
+  }
+
+  async function broadcast(p) {
+    const tab = await getTab();
+    if (tab) try { await chrome.tabs.sendMessage(tab.id, { type: "CGPTV_UPDATE_SETTINGS", payload: p }); } catch {}
+  }
+
+  function save(p) { return new Promise(r => chrome.storage.sync.set(p, r)); }
+
+  let dt = null;
+  function debSave() {
+    clearTimeout(dt);
+    dt = setTimeout(async () => { const p = readUI(); await save(p); await broadcast(p); await refresh(); }, 200);
+  }
+
+  async function commit() {
+    const p = readUI(); await save(p); await broadcast(p); await refresh();
+  }
+
+  function bind() {
+    $("enabled").addEventListener("change", commit);
+    $("msgLimit").addEventListener("input", () => {
+      $("limVal").textContent = $("msgLimit").value;
+      updateSliderFill();
+      debSave();
+    });
+  }
 
   async function init() {
-
-    const cfg = await new Promise((resolve) => {
-
-      chrome.storage.sync.get(DEFAULTS, (res) => resolve({ ...DEFAULTS, ...(res || {}) }));
-
-    });
-
-
-
-    applySettingsToUI(cfg);
-
-    bindEvents();
-
-    await requestLiveStats();
-
+    const c = await new Promise(r =>
+      chrome.storage.sync.get(DEFAULTS, res => r({ ...DEFAULTS, ...(res || {}) }))
+    );
+    applyUI(c);
+    initSeg();
+    bind();
+    await refresh();
   }
 
-
-
   init();
-
 })();

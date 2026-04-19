@@ -1,385 +1,286 @@
 (() => {
   "use strict";
 
-  const DEFAULT_SETTINGS = {
-    enabled: true,
-    messageLimit: 40,
-    autoOptimization: false
-  };
+  const LIMIT = 30, BATCH = 20;
+  const HIDE = "cgptv-hidden", BTN = "cgptv-load-more", BADGE = "cgptv-indicator";
+  const BRIDGE = "cgptv_settings";
+  const SELS = [
+    'section[data-testid^="conversation-turn-"]',
+    '[data-testid^="conversation-turn-"]',
+    'article',
+  ];
 
-  const BRIDGE_KEY = "cgptv_settings";
-  const BYPASS_KEY = "cgptv_skip_trim_once";
-  const INDICATOR_ID = "cgptv-indicator";
-  const LOAD_MORE_ID = "cgptv-load-more";
+  let enabled = true, limit = LIMIT, fetchBuffer = 40;
+  let root = null, obs = null, dying = false, pollId = null;
+  let visCount = 0, totCount = 0, cachedVis = 0;
+  let historyPatched = false;
+  let activeSel = SELS[0];
 
-  const LOAD_BATCH = 20;
+  const tracked = [], elMap = new Map();
 
-  const state = {
-    settings: { ...DEFAULT_SETTINGS },
-    initialized: false,
-    shuttingDown: false,
-    runtimeListenerAttached: false,
+  /* ── Hide class ── */
+  const sty = document.createElement("style");
+  sty.textContent = `.${HIDE}{display:none!important}`;
+  (document.head || document.documentElement).appendChild(sty);
 
-    observer: null,
-    conversationRoot: null,
-    detachedMessages: [],
-    cachedVisible: 0,
-    cachedTotal: 0,
+  /* ── Bridge settings to MAIN world ── */
+  function bridge() {
+    try { localStorage.setItem(BRIDGE, JSON.stringify({ enabled, messageLimit: limit, fetchBuffer })); } catch {}
+  }
+  bridge();
 
-    historyHooked: false,
-    trimQueued: false
-  };
-
-  const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
-
-  function isExtensionAlive() {
-    try {
-      return typeof chrome !== "undefined" && !!chrome.runtime?.id;
-    } catch {
-      return false;
+  /* ── Selector fallback ── */
+  function resolveSelector() {
+    for (const sel of SELS) {
+      if (document.querySelector(sel)) { activeSel = sel; return; }
     }
   }
 
-  function injectFetchInterceptor() {
-    try {
-      if (document.documentElement.dataset.cgptvInterceptorInjected === "1") return;
-      const src = chrome.runtime.getURL("fetchInterceptor.js");
-      const s = document.createElement("script");
-      s.src = src;
-      s.async = false;
-      s.onload = () => s.remove();
-      s.onerror = () => s.remove();
-      (document.head || document.documentElement).appendChild(s);
-      document.documentElement.dataset.cgptvInterceptorInjected = "1";
-    } catch {}
+  function findRoot() {
+    resolveSelector();
+    const t = document.querySelector(activeSel);
+    if (!t) return document.querySelector("main") || null;
+    // Walk up to find the actual list container (may be nested)
+    let parent = t.parentElement;
+    if (parent) return parent;
+    return document.querySelector("main") || null;
   }
 
-  function syncBridgeSettings() {
-    try {
-      localStorage.setItem(
-        BRIDGE_KEY,
-        JSON.stringify({
-          enabled: !!state.settings.enabled,
-          messageLimit: clamp(Number(state.settings.messageLimit) || 40, 10, 100)
-        })
-      );
-    } catch {}
-  }
-
-  async function loadSettings() {
-    if (!isExtensionAlive()) return;
-    const cfg = await new Promise((resolve) => {
-      try {
-        chrome.storage.sync.get(DEFAULT_SETTINGS, (res) => {
-          if (chrome.runtime?.lastError) return resolve(DEFAULT_SETTINGS);
-          resolve({ ...DEFAULT_SETTINGS, ...(res || {}) });
-        });
-      } catch {
-        resolve(DEFAULT_SETTINGS);
-      }
-    });
-
-    state.settings = { ...DEFAULT_SETTINGS, ...cfg };
-    state.settings.messageLimit = clamp(Number(state.settings.messageLimit) || 40, 10, 100);
-    syncBridgeSettings();
-  }
-
-  function attachRuntimeListener() {
-    if (state.runtimeListenerAttached || !isExtensionAlive()) return;
-
-    try {
-      chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-        if (state.shuttingDown || !msg?.type) return false;
-
-        if (msg.type === "CGPTV_PING") {
-          sendResponse?.({ ok: true });
-          return true;
-        }
-
-        if (msg.type === "CGPTV_UPDATE_SETTINGS") {
-          const next = { ...state.settings, ...(msg.payload || {}) };
-          next.messageLimit = clamp(Number(next.messageLimit) || 40, 10, 100);
-          state.settings = next;
-          syncBridgeSettings();
-          queueTrim();
-          sendResponse?.({ ok: true });
-          return true;
-        }
-
-        if (msg.type === "CGPTV_GET_STATS") {
-          sendResponse?.({
-            ok: true,
-            stats: {
-              totalMessages: state.cachedTotal,
-              renderedMessages: state.cachedVisible,
-              isEnabled: !!state.settings.enabled
-            }
-          });
-          return true;
-        }
-
-        if (msg.type === "CGPTV_LOAD_FULL_ONCE") {
-          try { localStorage.setItem(BYPASS_KEY, "true"); } catch {}
-          sendResponse?.({ ok: true });
-          return true;
-        }
-
-        return false;
-      });
-
-      state.runtimeListenerAttached = true;
-    } catch {}
-  }
-
-  function getConversationRoot() {
-    return (
-      document.querySelector('[data-testid="conversation-turn-list"]') ||
-      document.querySelector("main") ||
-      document.querySelector('[role="main"]') ||
-      null
-    );
-  }
-
-  function dedupeTop(nodes) {
-    const uniq = [...new Set(nodes)].filter((n) => n && n.isConnected);
-    return uniq.filter((el) => !uniq.some((other) => other !== el && other.contains(el)));
-  }
-
-  function getTurnNodes(root) {
+  function findTurns() {
     if (!root) return [];
-
-    let nodes = Array.from(root.querySelectorAll(':scope > [data-testid^="conversation-turn"]'));
-    if (nodes.length >= 2) return nodes;
-
-    nodes = Array.from(root.querySelectorAll('[data-testid^="conversation-turn"]'));
-    if (nodes.length >= 2) return dedupeTop(nodes);
-
-    nodes = Array.from(root.querySelectorAll(":scope > article"));
-    if (nodes.length >= 2) return nodes;
-
-    nodes = Array.from(root.querySelectorAll("article"));
-    return dedupeTop(nodes);
+    // Try direct children first
+    let nodes = Array.from(root.querySelectorAll(":scope > " + activeSel));
+    // If nothing found as direct children, search deeper
+    if (nodes.length === 0) {
+      nodes = Array.from(root.querySelectorAll(activeSel));
+    }
+    return nodes;
   }
 
-  function updateCachedStats() {
-    const root = state.conversationRoot || getConversationRoot();
-    const visible = root ? getTurnNodes(root).length : 0;
-    state.cachedVisible = visible;
-    state.cachedTotal = visible + state.detachedMessages.length;
+  /* ── Tracking ── */
+  function track(el) {
+    if (elMap.has(el)) return;
+    const m = { el, vis: true, id: el.getAttribute("data-testid") || `m${tracked.length}` };
+    tracked.push(m); elMap.set(el, m);
+  }
+  function hide(m) { if (!m.vis) return; m.vis = false; m.el.classList.add(HIDE); }
+  function show(m) { if (m.vis) return; m.vis = true; m.el.classList.remove(HIDE); }
+
+  /* ── recalc uses `limit` directly ── */
+  function recalc() {
+    if (!enabled) { for (const m of tracked) show(m); counts(); return; }
+    const lim = Math.max(cachedVis, limit);
+    const n = tracked.length;
+    for (let i = 0; i < n; i++) i < n - lim ? hide(tracked[i]) : show(tracked[i]);
+    counts();
   }
 
-  function ensureIndicator() {
-    let el = document.getElementById(INDICATOR_ID);
-    if (!el) {
+  function counts() {
+    visCount = 0;
+    for (const m of tracked) if (m.vis) visCount++;
+    totCount = tracked.length;
+  }
+
+  function initTurns(els) {
+    tracked.length = 0; elMap.clear(); cachedVis = 0;
+    for (const el of els) track(el);
+    recalc();
+  }
+
+  /* ── Load More button — placed BEFORE root so React can't remove it ── */
+  function syncBtn() {
+    let b = document.getElementById(BTN);
+    const hid = totCount - visCount;
+
+    if (!enabled || hid <= 0) {
+      if (b) b.style.display = "none";
+      return;
+    }
+
+    if (!b) {
+      b = document.createElement("div");
+      b.id = BTN;
+      b.addEventListener("click", loadMore);
+      // Insert BEFORE root (outside React's container) so React can't remove it
+      if (root && root.parentElement) {
+        root.parentElement.insertBefore(b, root);
+      } else if (document.body) {
+        document.body.appendChild(b);
+      }
+    }
+
+    b.style.display = "";
+    b.textContent = `Load ${Math.min(BATCH, hid)} previous messages (configure in extension settings)`;
+
+    // If button got disconnected (React re-rendered parent), re-insert
+    if (!b.isConnected) {
+      if (root && root.parentElement) {
+        root.parentElement.insertBefore(b, root);
+      }
+    }
+  }
+
+  /* ── Load More — micro-batch 8 nodes/frame ── */
+  function loadMore() {
+    const hidden = tracked.filter(m => !m.vis);
+    const toReveal = hidden.slice(-BATCH);
+    if (!toReveal.length) return;
+    let idx = 0;
+    function tick() {
+      const end = Math.min(idx + 8, toReveal.length);
+      for (; idx < end; idx++) show(toReveal[idx]);
+      counts(); syncBadge();
+      if (idx < toReveal.length) requestAnimationFrame(tick);
+      else { cachedVis = visCount; syncBtn(); syncBadge(); }
+    }
+    requestAnimationFrame(tick);
+  }
+
+  /* ── Badge — always visible, always fresh ── */
+  function syncBadge() {
+    let el = document.getElementById(BADGE);
+    if (!el && document.body) {
       el = document.createElement("div");
-      el.id = INDICATOR_ID;
-      (document.body || document.documentElement).appendChild(el);
+      el.id = BADGE;
+      document.body.appendChild(el);
     }
-    return el;
-  }
+    if (!el) return;
 
-  function updateIndicator() {
-    updateCachedStats();
-    const el = ensureIndicator();
-
-    const trimHitTs = document.documentElement.getAttribute("data-cgptv-fetch-trim-hit");
-    const trimmedRecently = trimHitTs && Date.now() - Number(trimHitTs) < 120000;
-
-    el.textContent = state.settings.enabled
-      ? `${trimmedRecently ? "⚡" : "…"} ${state.cachedVisible} / ${state.cachedTotal}`
-      : `Off ${state.cachedVisible}/${state.cachedTotal}`;
-
-    el.style.opacity = state.settings.enabled ? "1" : "0.72";
-  }
-
-  function buildLoadMoreButton() {
-    const btn = document.createElement("button");
-    btn.id = LOAD_MORE_ID;
-    btn.type = "button";
-    btn.textContent = "Load more";
-    btn.addEventListener("click", () => restoreBatch(LOAD_BATCH));
-    return btn;
-  }
-
-  function ensureLoadMoreButton() {
-    let btn = document.getElementById(LOAD_MORE_ID);
-    if (!btn) {
-      btn = buildLoadMoreButton();
-      (document.body || document.documentElement).appendChild(btn);
-    }
-    return btn;
-  }
-
-  function updateLoadMoreButton() {
-    const btn = ensureLoadMoreButton();
-    const hidden = state.detachedMessages.length;
-
-    if (!state.settings.enabled || hidden <= 0) {
-      btn.style.display = "none";
-      return;
+    // If badge was removed from DOM, re-insert
+    if (!el.isConnected && document.body) {
+      document.body.appendChild(el);
     }
 
-    btn.style.display = "block";
-    btn.textContent = `Load more (${hidden} hidden)`;
+    el.textContent = enabled ? `⚡ ${visCount} / ${totCount}` : "Off";
   }
 
-  function restoreBatch(count) {
-    const root = state.conversationRoot || getConversationRoot();
-    if (!root || !state.detachedMessages.length) return;
-
-    const take = Math.min(count, state.detachedMessages.length);
-    const start = state.detachedMessages.length - take;
-    const batch = state.detachedMessages.splice(start, take);
-
-    const frag = document.createDocumentFragment();
-    for (const node of batch) if (node) frag.appendChild(node);
-
-    const firstTurn = getTurnNodes(root)[0];
-    if (firstTurn) root.insertBefore(frag, firstTurn);
-    else root.appendChild(frag);
-
-    updateIndicator();
-    updateLoadMoreButton();
-  }
-
-  async function trimNow() {
-    state.trimQueued = false;
-    if (state.shuttingDown) return;
-
-    const root = state.conversationRoot || getConversationRoot();
-    if (!root) return;
-
-    if (!state.settings.enabled) {
-      if (state.detachedMessages.length) {
-        const frag = document.createDocumentFragment();
-        for (const n of state.detachedMessages) if (n) frag.appendChild(n);
-        const first = root.firstChild;
-        if (first) root.insertBefore(frag, first);
-        else root.appendChild(frag);
-        state.detachedMessages = [];
+  /* ── Observer — scoped ── */
+  function connectObs() {
+    if (obs || !root) return;
+    obs = new MutationObserver(muts => {
+      if (dying) return;
+      let ch = false;
+      for (const mu of muts) {
+        for (const n of mu.addedNodes)
+          if (n.nodeType === 1 && n.matches?.(activeSel)) { track(n); ch = true; }
+        for (const n of mu.removedNodes)
+          if (n.nodeType === 1 && elMap.has(n)) {
+            const i = tracked.findIndex(m => m.el === n);
+            if (i >= 0) tracked.splice(i, 1);
+            elMap.delete(n); ch = true;
+          }
       }
-      updateIndicator();
-      updateLoadMoreButton();
-      return;
-    }
-
-    const limit = clamp(Number(state.settings.messageLimit) || 40, 10, 100);
-
-    while (!state.shuttingDown) {
-      const turns = getTurnNodes(root);
-      const excess = turns.length - limit;
-      if (excess <= 0) break;
-
-      const slice = turns.slice(0, Math.min(excess, 12));
-      for (const node of slice) {
-        if (!node?.isConnected) continue;
-        state.detachedMessages.push(node);
-        node.remove();
-      }
-
-      await new Promise((r) => requestAnimationFrame(r));
-    }
-
-    updateIndicator();
-    updateLoadMoreButton();
-  }
-
-  function queueTrim() {
-    if (state.trimQueued || state.shuttingDown) return;
-    state.trimQueued = true;
-    requestAnimationFrame(() => trimNow());
-  }
-
-  function disconnectObserver() {
-    try { state.observer?.disconnect(); } catch {}
-    state.observer = null;
-  }
-
-  function connectObserver() {
-    const root = getConversationRoot();
-    if (!root) return false;
-
-    if (state.conversationRoot === root && state.observer) return true;
-
-    disconnectObserver();
-    state.conversationRoot = root;
-
-    state.observer = new MutationObserver((mutations) => {
-      if (state.shuttingDown) return;
-      for (const m of mutations) {
-        if (m.type !== "childList") continue;
-        if (!m.addedNodes.length && !m.removedNodes.length) continue;
-        queueTrim();
-        break;
-      }
+      if (ch) { recalc(); syncBtn(); syncBadge(); }
     });
+    // Watch both direct children and subtree for deeper nesting
+    obs.observe(root, { childList: true, subtree: true });
+  }
+  function disconnectObs() { obs?.disconnect(); obs = null; }
 
-    state.observer.observe(root, { childList: true, subtree: false });
-    return true;
+  /* ── Root found ── */
+  function onRoot(r) {
+    root = r;
+    const turns = findTurns();
+    initTurns(turns);
+    connectObs();
+    syncBtn();
+    syncBadge();
+    // Stop fast poll, switch to slow periodic sync
+    if (pollId) { clearInterval(pollId); pollId = null; }
   }
 
-  function hookHistoryNavigation() {
-    if (state.historyHooked) return;
-    state.historyHooked = true;
+  // Fast poll to find root
+  pollId = setInterval(() => {
+    if (dying) { clearInterval(pollId); pollId = null; return; }
+    const r = findRoot();
+    if (r && r !== root) onRoot(r);
+  }, 120);
 
-    const onNav = () => {
-      if (state.shuttingDown) return;
-      state.detachedMessages = [];
-      state.conversationRoot = null;
-      disconnectObserver();
+  /* ── PERIODIC SYNC — keeps badge + button alive even if observer doesn't fire ── */
+  setInterval(() => {
+    if (dying || document.hidden) return;
 
-      setTimeout(() => {
-        if (state.shuttingDown) return;
-        connectObserver();
-        queueTrim();
-      }, 80);
-    };
-
-    const wrap = (fn) => function (...args) {
-      const out = fn.apply(this, args);
+    // Re-check root
+    if (!root || !root.isConnected) {
       onNav();
-      return out;
-    };
+      return;
+    }
 
-    history.pushState = wrap(history.pushState);
-    history.replaceState = wrap(history.replaceState);
+    // Re-scan turns in case we missed some
+    const turns = findTurns();
+    let changed = false;
+    for (const el of turns) {
+      if (!elMap.has(el)) { track(el); changed = true; }
+    }
+    if (changed) recalc();
+
+    // Always refresh badge and button
+    syncBadge();
+    syncBtn();
+  }, 2000);
+
+  /* ── Navigation — History API hooks ── */
+  function onNav() {
+    root = null; tracked.length = 0; elMap.clear(); cachedVis = 0;
+    disconnectObs();
+    const btn = document.getElementById(BTN);
+    if (btn) btn.style.display = "none";
+    // Restart fast poll to find new root
+    if (!pollId && !dying) {
+      pollId = setInterval(() => {
+        if (dying) { clearInterval(pollId); pollId = null; return; }
+        const r = findRoot();
+        if (r && r !== root) onRoot(r);
+      }, 120);
+    }
+  }
+
+  if (!historyPatched) {
+    historyPatched = true;
+    const _push = history.pushState, _repl = history.replaceState;
+    history.pushState = function () { _push.apply(this, arguments); onNav(); };
+    history.replaceState = function () { _repl.apply(this, arguments); onNav(); };
     window.addEventListener("popstate", onNav);
   }
 
-  function cleanup() {
-    state.shuttingDown = true;
-    disconnectObserver();
-    try { document.getElementById(INDICATOR_ID)?.remove(); } catch {}
-    try { document.getElementById(LOAD_MORE_ID)?.remove(); } catch {}
-  }
+  /* ── Settings ── */
+  try {
+    chrome.storage.sync.get({ enabled: true, messageLimit: LIMIT, fetchBuffer: 40 }, r => {
+      if (chrome.runtime?.lastError) return;
+      enabled = r.enabled !== false;
+      limit = Math.max(10, Math.min(100, Number(r.messageLimit) || LIMIT));
+      fetchBuffer = Number(r.fetchBuffer) || 40;
+      bridge();
+      if (root) { recalc(); syncBtn(); syncBadge(); }
+    });
+  } catch {}
 
-  async function init() {
-    if (state.initialized) return;
+  try {
+    chrome.runtime.onMessage.addListener((msg, _, reply) => {
+      if (!msg?.type) return false;
+      if (msg.type === "CGPTV_PING") { reply?.({ ok: true }); return true; }
+      if (msg.type === "CGPTV_UPDATE_SETTINGS") {
+        const p = msg.payload || {};
+        enabled = p.enabled !== false;
+        limit = Math.max(10, Math.min(100, Number(p.messageLimit) || LIMIT));
+        fetchBuffer = Number(p.fetchBuffer) || 40;
+        cachedVis = 0;
+        bridge(); recalc(); syncBtn(); syncBadge();
+        reply?.({ ok: true }); return true;
+      }
+      if (msg.type === "CGPTV_GET_STATS") {
+        reply?.({ ok: true, stats: { totalMessages: totCount, renderedMessages: visCount, isEnabled: enabled } });
+        return true;
+      }
+      return false;
+    });
+  } catch {}
 
-    window.addEventListener("pagehide", cleanup, { once: true });
-    window.addEventListener("beforeunload", cleanup, { once: true });
-
-    injectFetchInterceptor();
-    await loadSettings();
-    if (state.shuttingDown) return;
-
-    attachRuntimeListener();
-    ensureIndicator();
-    ensureLoadMoreButton();
-    hookHistoryNavigation();
-
-    const start = Date.now();
-    while (!state.shuttingDown && Date.now() - start < 12000) {
-      if (connectObserver()) break;
-      await new Promise((r) => setTimeout(r, 80));
-    }
-
-    queueTrim();
-    setTimeout(queueTrim, 120);
-    setTimeout(queueTrim, 400);
-
-    state.initialized = true;
-  }
-
-  init();
+  window.addEventListener("pagehide", () => {
+    dying = true;
+    if (pollId) clearInterval(pollId);
+    disconnectObs();
+    document.getElementById(BTN)?.remove();
+    document.getElementById(BADGE)?.remove();
+  }, { once: true });
 })();
